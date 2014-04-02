@@ -17,131 +17,21 @@
 # limitations under the License.
 #
 include_recipe "apache2"
-include_recipe "apache2::mod_wsgi"
-include_recipe "apache2::mod_rewrite"
 include_recipe "osops-utils::mod_ssl"
 include_recipe "osops-utils::ssl_packages"
 
-# Remove monit conf file if it exists
-if node.attribute? "monit"
-  if node["monit"].attribute?"conf.d_dir"
-    file "#{node['monit']['conf.d_dir']}/keystone.conf" do
-      action :delete
-      notifies :reload, "service[monit]", :immediately
-    end
-  end
-end
+# Fix haproxy configs to work with SSL
+node.set['ha']['available_services']['keystone-admin-api']['lb_mode'] = 'tcp'
+node.set['ha']['available_services']['keystone-service-api']['lb_mode'] = 'tcp'
+node.set['ha']['available_services']['keystone-internal-api']['lb_mode'] = 'tcp'
 
-# setup cert files
-case node["platform"]
-when "ubuntu", "debian"
-  grp = "ssl-cert"
-else
-  grp = "root"
-end
-
-#admin API
-cookbook_file "#{node["keystone"]["ssl"]["dir"]}/certs/#{node["keystone"]["services"]["admin-api"]["cert_file"]}" do
-  source "keystone_admin.pem"
-  mode 0644
-  owner "root"
-  group "root"
-end
-cookbook_file "#{node["keystone"]["ssl"]["dir"]}/private/#{node["keystone"]["services"]["admin-api"]["key_file"]}" do
-  source "keystone_admin.key"
-  mode 0644
-  owner "root"
-  group grp
-end
-unless node["keystone"]["services"]["admin-api"]["chain_file"].nil?
-  cookbook_file "#{node["keystone"]["ssl"]["dir"]}/certs/#{node["keystone"]["services"]["admin-api"]["chain_file"]}" do
-    source node["keystone"]["services"]["admin-api"]["chain_file"]
-    mode 0644
-    owner "root"
-    group "root"
-  end
-end
-
-#Service API
-cookbook_file "#{node["keystone"]["ssl"]["dir"]}/certs/#{node["keystone"]["services"]["service-api"]["cert_file"]}" do
-  source "keystone_service.pem"
-  mode 0644
-  owner "root"
-  group "root"
-end
-cookbook_file "#{node["keystone"]["ssl"]["dir"]}/private/#{node["keystone"]["services"]["service-api"]["key_file"]}" do
-  source "keystone_service.key"
-  mode 0644
-  owner "root"
-  group grp
-end
-unless node["keystone"]["services"]["service-api"]["chain_file"].nil?
-  cookbook_file "#{node["keystone"]["ssl"]["dir"]}/certs/#{node["keystone"]["services"]["service-api"]["chain_file"]}" do
-    source node["keystone"]["services"]["service-api"]["chain_file"]
-    mode 0644
-    owner "root"
-    group "root"
-  end
-end
-
-#Internal URI
-cookbook_file "#{node["keystone"]["ssl"]["dir"]}/certs/#{node["keystone"]["services"]["internal-api"]["cert_file"]}" do
-  source "keystone_internal.pem"
-  mode 0644
-  owner "root"
-  group "root"
-end
-cookbook_file "#{node["keystone"]["ssl"]["dir"]}/private/#{node["keystone"]["services"]["internal-api"]["key_file"]}" do
-  source "keystone_internal.key"
-  mode 0644
-  owner "root"
-  group grp
-end
-unless node["keystone"]["services"]["internal-api"]["chain_file"].nil?
-  cookbook_file "#{node["keystone"]["ssl"]["dir"]}/certs/#{node["keystone"]["services"]["internal-api"]["chain_file"]}" do
-    source node["keystone"]["services"]["internal-api"]["chain_file"]
-    mode 0644
-    owner "root"
-    group "root"
-  end
-end
-
-# setup wsgi file
-
-directory "#{node["apache"]["dir"]}/wsgi" do
-  action :create
-  owner "root"
-  group "root"
-  mode "0755"
-end
-
-cookbook_file "#{node["apache"]["dir"]}/wsgi/#{node["keystone"]["services"]["admin-api"]["wsgi_file"]}" do
-  source "keystone_modwsgi.py"
-  mode 0644
-  owner "root"
-  group "root"
-end
-
-cookbook_file "#{node["apache"]["dir"]}/wsgi/#{node["keystone"]["services"]["service-api"]["wsgi_file"]}" do
-  source "keystone_modwsgi.py"
-  mode 0644
-  owner "root"
-  group "root"
-end
-
-cookbook_file "#{node["apache"]["dir"]}/wsgi/#{node["keystone"]["services"]["internal-api"]["wsgi_file"]}" do
-  source "keystone_modwsgi.py"
-  mode 0644
-  owner "root"
-  group "root"
-end
-# Get the IP to bind to, "*" if only 1 node
 ks_admin_bind = get_bind_endpoint("keystone", "admin-api")
 ks_service_bind = get_bind_endpoint("keystone", "service-api")
 ks_internal_bind = get_bind_endpoint("keystone", "internal-api")
 
 ha_role = "openstack-ha"
 vip_key = "vips.keystone-admin-api"
+
 if get_role_count(ha_role) > 0 and rcb_safe_deref(node, vip_key)
   admin_ip = ks_admin_bind["host"]
   service_ip = ks_service_bind["host"]
@@ -149,101 +39,110 @@ if get_role_count(ha_role) > 0 and rcb_safe_deref(node, vip_key)
 else
   admin_ip = "*"
   service_ip = "*"
+  internal_ip = "*"
 end
 
-# Admin API
-unless node["keystone"]["services"]["admin-api"].attribute?"cert_override"
-  admin_cert_location = "#{node["keystone"]["ssl"]["dir"]}/certs/#{node["keystone"]["services"]["admin-api"]["cert_file"]}"
-else
-  admin_cert_location = node["keystone"]["services"]["admin-api"]["cert_override"]
-end
-unless node["keystone"]["services"]["admin-api"].attribute?"key_override"
-  admin_key_location = "#{node["keystone"]["ssl"]["dir"]}/private/#{node["keystone"]["services"]["admin-api"]["key_file"]}"
-else
-  admin_key_location = node["keystone"]["services"]["admin-api"]["key_override"]
-end
-unless node["keystone"]["services"]["admin-api"]["chain_file"].nil?
-  admin_chain_location = "#{node["keystone"]["ssl"]["dir"]}/certs/#{node["keystone"]["services"]["admin-api"]["chain_file"]}"
-else
-  admin_chain_location = "donotset"
+# Hash for cert/key/chain file locations (per service)
+certs  = {}
+ssldir = node['keystone']['ssl']['dir']
+
+# Platform stuff
+case node['platform_family']
+when 'debian'
+  cert_group = 'ssl-cert'
+  vhost_path = "#{node["apache"]["dir"]}/sites-available/openstack-keystone"
+when 'rhel'
+  cert_group = 'root'
+  vhost_path = "#{node["apache"]["dir"]}/conf.d/openstack-keystone"
 end
 
-# Service API
-unless node["keystone"]["services"]["service-api"].attribute?"cert_override"
-  service_cert_location = "#{node["keystone"]["ssl"]["dir"]}/certs/#{node["keystone"]["services"]["service-api"]["cert_file"]}"
-else
-  service_cert_location = node["keystone"]["services"]["service-api"]["cert_override"]
-end
-unless node["keystone"]["services"]["service-api"].attribute?"key_override"
-  service_key_location = "#{node["keystone"]["ssl"]["dir"]}/private/#{node["keystone"]["services"]["service-api"]["key_file"]}"
-else
-  service_key_location = node["keystone"]["services"]["service-api"]["key_override"]
-end
-unless node["keystone"]["services"]["service-api"]["chain_file"].nil?
-  service_chain_location = "#{node["keystone"]["ssl"]["dir"]}/certs/#{node["keystone"]["services"]["service-api"]["chain_file"]}"
-else
-  service_chain_location = "donotset"
+# Iterate each service type and populate `certs' hash, possibly creating
+# default files along the way (unless user configured overrides).
+#
+%w{admin service internal}.each do |svc|
+  # make a home for this service's file paths
+  certs[svc] = {} unless certs.has_key?(svc)
+
+  # save reference to node hash we'll use frequently
+  hsh = node['keystone']['services']["#{svc}-api"]
+  Chef::Log.info("hsh = #{hsh.inspect}")
+
+  # PEM file
+  if hsh.has_key?('cert_override')
+    certs[svc]['cert_file'] = hsh['cert_override']
+  else
+    certs[svc]['cert_file'] = "#{ssldir}/certs/#{hsh['cert_file']}"
+    cookbook_file certs[svc]['cert_file'] do
+      source "keystone_#{svc}.pem"
+      mode 0644
+      owner 'root'
+      group 'root'
+    end
+  end
+
+  # Private key
+  if hsh.has_key?('key_override')
+    certs[svc]['key_file'] = hsh['key_override']
+  else
+    certs[svc]['key_file'] = "#{ssldir}/private/#{hsh['key_file']}"
+    cookbook_file certs[svc]['key_file'] do
+      source "keystone_#{svc}.key"
+      mode 0644
+      owner 'root'
+      group cert_group
+    end
+  end
+
+  # Chain file (different logic for this one)
+  if hsh.has_key?('chain_file') and not hsh['chain_file'].nil?
+    certs[svc]['chain_file'] = "#{ssldir}/certs/#{hsh['chain_file']}"
+    cookbook_file certs[svc]['chain_file'] do
+      source hsh['chain_file']
+      mode 0644
+      owner 'root'
+      group 'root'
+    end
+  else
+    certs[svc]['chain_file'] = 'donotset'
+  end
 end
 
-# Internal API
-unless node["keystone"]["services"]["internal-api"].attribute?"cert_override"
-  internal_cert_location = "#{node["keystone"]["ssl"]["dir"]}/certs/#{node["keystone"]["services"]["service-api"]["cert_file"]}"
-else
-  internal_cert_location = node["keystone"]["services"]["internal-api"]["cert_override"]
-end
-unless node["keystone"]["services"]["internal-api"].attribute?"key_override"
-  internal_key_location = "#{node["keystone"]["ssl"]["dir"]}/private/#{node["keystone"]["services"]["internal-api"]["key_file"]}"
-else
-  internal_key_location = node["keystone"]["services"]["internal-api"]["key_override"]
-end
-unless node["keystone"]["services"]["internal-api"]["chain_file"].nil?
-  internal_chain_location = "#{node["keystone"]["ssl"]["dir"]}/certs/#{node["keystone"]["services"]["internal-api"]["chain_file"]}"
-else
-  internal_chain_location = "donotset"
-end
-
-template value_for_platform(
-  ["ubuntu", "debian", "fedora"] => {
-    "default" => "#{node["apache"]["dir"]}/sites-available/openstack-keystone"
-  },
-  "fedora" => {
-    "default" => "#{node["apache"]["dir"]}/vhost.d/openstack-keystone"
-  },
-  ["redhat", "centos"] => {
-    "default" => "#{node["apache"]["dir"]}/conf.d/openstack-keystone"
-  },
-  "default" => {
-    "default" => "#{node["apache"]["dir"]}/openstack-keystone"
-  }
-) do
+# Create Apache vhost
+# TODO(brett): can this be generalized for apache LWRPs?
+template vhost_path do
   source "keystone_ssl_vhost.erb"
   owner "root"
   group "root"
   mode "0644"
   variables(
-    :service_ip => service_ip,
-    :service_scheme => node["keystone"]["services"]["service-api"]["scheme"],
-    :service_port => node["keystone"]["services"]["service-api"]["port"],
-    :service_cert_file => service_cert_location,
-    :service_key_file => service_key_location,
-    :service_chain_file => service_chain_location,
-    :service_wsgi_file  => "#{node["apache"]["dir"]}/wsgi/#{node["keystone"]["services"]["service-api"]["wsgi_file"]}",
     :admin_ip => admin_ip,
     :admin_scheme => node["keystone"]["services"]["admin-api"]["scheme"],
     :admin_port => node["keystone"]["services"]["admin-api"]["port"],
-    :admin_cert_file => admin_cert_location,
-    :admin_key_file => admin_key_location,
-    :admin_chain_file => admin_chain_location,
-    :admin_wsgi_file => "#{node["apache"]["dir"]}/wsgi/#{node["keystone"]["services"]["admin-api"]["wsgi_file"]}",
+    :admin_cert_file => certs['admin']['cert_file'],
+    :admin_key_file => certs['admin']['key_file'],
+    :admin_chain_file => certs['admin']['chain_file'],
+
+    :service_ip => service_ip,
+    :service_scheme => node["keystone"]["services"]["service-api"]["scheme"],
+    :service_port => node["keystone"]["services"]["service-api"]["port"],
+    :service_cert_file => certs['service']['cert_file'],
+    :service_key_file => certs['service']['key_file'],
+    :service_chain_file => certs['service']['chain_file'],
+
+    :internal_ip => internal_ip,
     :internal_scheme => node["keystone"]["services"]["internal-api"]["scheme"],
-    :internal_ip => internal_ip || service_ip,
     :internal_port => node["keystone"]["services"]["internal-api"]["port"],
-    :internal_cert_file => internal_cert_location,
-    :internal_key_file => internal_key_location,
-    :internal_chain_file => internal_chain_location,
-    :internal_wsgi_file  => "#{node["apache"]["dir"]}/wsgi/#{node["keystone"]["services"]["internal-api"]["wsgi_file"]}"
+    :internal_cert_file => certs['internal']['cert_file'],
+    :internal_key_file => certs['internal']['key_file'],
+    :internal_chain_file => certs['internal']['chain_file']
   )
-  notifies :run, "execute[Keystone: sleep]", :immediately
+  #notifies :run, "execute[Keystone: sleep]", :immediately
+  #notifies :restart, "service[apache2]", :immediately
+  notifies :restart, "service[apache2]"
+end
+
+apache_module 'proxy_http' do
+  enable true
 end
 
 apache_site "openstack-keystone" do
@@ -252,5 +151,12 @@ end
 
 service "apache2" do
   action :restart
+end
+
+if get_role_count("openstack-ha") > 0 and rcb_safe_deref(node, "vips.keystone-admin-api")
+  include_recipe "openstack-ha::default"
+  service "haproxy" do
+    action :restart
+  end
 end
 

@@ -29,32 +29,33 @@ file "/var/log/keystone/keystone.log" do
   only_if { ::File.exists?("/var/log/keystone/keystone.log") }
 end
 
-if node.recipe? "apache2"
-  # Used if SSL was or is enabled
-  vhost_location = value_for_platform(
-    ["ubuntu", "debian", "fedora"] => {
-      "default" => "#{node["apache"]["dir"]}/sites-enabled/openstack-keystone"
-    },
-    "fedora" => {
-      "default" => "#{node["apache"]["dir"]}/vhost.d/openstack-keystone"
-    },
-    ["redhat", "centos"] => {
-      "default" => "#{node["apache"]["dir"]}/conf.d/openstack-keystone"
-    },
-    "default" => {
-      "default" => "#{node["apache"]["dir"]}/openstack-keystone"
-    }
-  )
-  # If no URI is SSL enabled check to see if vhost existed,
-  # delete it and bounce httpd
-  # Used when going from https -> http
-  execute "Disable https" do
-    command "rm -f #{vhost_location}"
-    only_if { File.exists?(vhost_location) }
-    notifies :restart, "service[apache2]", :immediately
-    action :nothing
-  end
-end
+#if node.recipe? "apache2"
+#  # Used if SSL was or is enabled
+#  vhost_location = value_for_platform(
+#    ["ubuntu", "debian"] => {
+#      "default" => "#{node["apache"]["dir"]}/sites-enabled/openstack-keystone"
+#    },
+#    ["redhat", "centos"] => {
+#      "default" => "#{node["apache"]["dir"]}/conf.d/openstack-keystone"
+#    },
+#    "default" => {
+#      "default" => "#{node["apache"]["dir"]}/openstack-keystone"
+#    }
+#  )
+#  # If no URI is SSL enabled check to see if vhost existed,
+#  # delete it and bounce httpd
+#  # Used when going from https -> http
+#  #execute "Disable https" do
+#  #  command "rm -f #{vhost_location}"
+#  #  only_if { File.exists?(vhost_location) }
+#  #  notifies :restart, "service[apache2]", :immediately
+#  #  action :nothing
+#  #end
+#  apache_site "openstack-keystone" do
+#    enable false
+#    notifies :restart, "service[apache2]", :immediately
+#  end
+#end
 
 platform_options = node["keystone"]["platform"]
 
@@ -68,14 +69,15 @@ keystone_pkgs.each do |pkg|
   end
 end
 
+# FIXME(brett): why are supporting_pkgs installed after main packages?
 supporting_pkgs.each do |pkg|
   include_recipe "osops-utils::#{pkg}"
 end
 
-execute "Keystone: sleep" do
-  command "sleep 10s"
-  action :nothing
-end
+#execute "Keystone: sleep" do
+#  command "sleep 10s"
+#  action :nothing
+#end
 
 ks_admin_bind = get_bind_endpoint("keystone", "admin-api")
 ks_service_bind = get_bind_endpoint("keystone", "service-api")
@@ -94,27 +96,13 @@ service "keystone" do
   end
   # end TODO
   supports :status => true, :restart => true
-  unless end_point_schemes.any? {|scheme| scheme == "https"}
-    if node.recipe? "apache2"
-      notifies :run, "execute[Disable https]", :immediately
-    end
-    action [:enable]
-    notifies :run, "execute[Keystone: sleep]", :immediately
-  else
-    action [ :disable, :stop ]
-  end
-end
-
-# Setup SSL if "scheme" is set to https
-if end_point_schemes.any? {|scheme| scheme == "https"}
-  include_recipe "keystone::keystone-ssl"
-else
-  if node.recipe? "apache2"
-    apache_site "openstack-keystone" do
-      enable false
-      notifies :restart, "service[apache2]", :immediately
-    end
-  end
+  #if not end_point_schemes.any? {|scheme| scheme == "https"}
+  #  if node.recipe? "apache2"
+  #    notifies :run, "execute[Disable https]", :immediately
+  #    notifies :run, "execute[Keystone: sleep]", :immediately
+  #  end
+  #end
+  action [:enable]
 end
 
 directory "/etc/keystone" do
@@ -131,18 +119,27 @@ execute "keystone-manage pki_setup" do
   action :nothing
 end
 
-settings = get_settings_by_role(ks_setup_role, "keystone")
-mysql_info = get_mysql_endpoint(ks_mysql_role)
-
-# only bind to 0.0.0.0 if we're not using openstack-ha w/ a keystone-admin-api VIP,
-# otherwise HAProxy will fail to start when trying to bind to keystone VIP
+# HA stuff for conditional immediately below
 ha_role = "openstack-ha"
 vip_key = "vips.keystone-admin-api"
-if get_role_count(ha_role) > 0 and rcb_safe_deref(node, vip_key)
+
+# if scheme is https, bind localhost (regardless of HA). Apache vhost will
+# bind host ip and terminate ssl for us, reverse-proxying to localhost.
+if end_point_schemes.any? {|scheme| scheme == "https"}
+  ip_address = '127.0.0.1'
+
+# if HA is in use (without SSL), bind single interface instead of 0.0.0.0
+# so haproxy doesn't fail to bind its APIPA address.
+elsif get_role_count(ha_role) > 0 and rcb_safe_deref(node, vip_key)
   ip_address = ks_admin_bind["host"]
+
+# if no SSL or HA is in use, just bind 0.0.0.0.
 else
   ip_address = "0.0.0.0"
 end
+
+settings = get_settings_by_role(ks_setup_role, "keystone")
+mysql_info = get_mysql_endpoint(ks_mysql_role)
 
 # Setup db_info hash for use in the template
 db_info = {
@@ -198,12 +195,29 @@ template "/etc/keystone/keystone.conf" do
   end
   # FIXME: Workaround for https://bugs.launchpad.net/keystone/+bug/1176270
   subscribes :create, "keystone_role[Get Member role-id]", :delayed
-  unless end_point_schemes.any? {|scheme| scheme == "https"}
-    notifies :restart, "service[keystone]", :immediately
-  else
-    notifies :restart, "service[apache2]", :immediately
-  end
+  notifies :restart, "service[keystone]", :immediately
 end
+
+
+
+
+
+# Setup SSL if "scheme" is set to https
+if end_point_schemes.any? {|scheme| scheme == "https"}
+  include_recipe "keystone::keystone-ssl"
+#else
+#  if node.recipe? "apache2"
+#    apache_site "openstack-keystone" do
+#      enable false
+#      notifies :restart, "service[apache2]", :immediately
+#    end
+#  end
+end
+
+
+
+
+
 
 # set up a token cleaning job
 template "/etc/cron.d/keystone-token-cleanup" do
